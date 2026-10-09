@@ -25,6 +25,9 @@ desktop.ini
 *.swp
 *~
 
+# Local agent / tooling state
+.opencode/
+
 # Env / secrets
 .env
 .env.*
