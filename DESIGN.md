@@ -73,7 +73,8 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
 
 ## 三、实现步骤
 
-1. 在 `packages/codearts/` 建包，`package.json` 声明 `magpie` 元数据与 `type: module`。
+1. 建包（本仓库为单包，插件直接放在仓库根目录），`package.json` 声明
+   `magpie` 元数据与 `type: module`。
 2. `index.mjs` 导出插件函数 `CodeArtsAuthPlugin({ client }, options)`，返回
    `{ config, provider, auth }`：
    - `config`：用 `??=` 注册 `codearts` provider 与 `CATALOG` 模型，不覆盖用户配置。
@@ -88,7 +89,7 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
 ## 四、目录
 
 ```
-packages/codearts/
+./  (仓库根 = 插件目录)
 ├── package.json
 ├── index.mjs
 ├── index.test.mjs

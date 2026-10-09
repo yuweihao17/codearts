@@ -13,8 +13,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/magpie-community/plugins.git",
-    "directory": "packages/codearts"
+    "url": "git+https://github.com/yuweihao17/codearts.git"
   },
   "magpie": { "maxConcurrency": 4 }
 }

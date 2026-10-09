@@ -21,14 +21,14 @@ Key**：请求要用临时的 AK/SK/security-token 凭据做 *SDK-HMAC-SHA256* �
 ## 安装
 
 ```sh
-magpie plugin add https://github.com/magpie-community/plugins/tree/main/packages/codearts
+magpie plugin add yuweihao17/codearts
 
 ```
 
 或本地开发：
 
 ```sh
-magpie plugin add ./packages/codearts/index.mjs
+magpie plugin add ./index.mjs
 
 ```
 
