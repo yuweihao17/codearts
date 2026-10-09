@@ -1,0 +1,12 @@
+{
+  "package": "@magpie-community/opencode-codearts-auth",
+  "name": "CodeArts",
+  "icon": "codearts",
+  "providers": ["codearts"],
+  "community": true,
+  "replaces": "codearts",
+  "summary": {
+    "en": "Huawei Cloud CodeArts (码道) models — openPangu, DeepSeek, GLM and more — via Huawei Cloud OAuth sign-in (PKCE + DPoP) with signed requests.",
+    "zh": "通过华为云 OAuth 授权登录接入码道模型：盘古 openPangu、DeepSeek、GLM 等（PKCE + DPoP，请求签名）。"
+  }
+}

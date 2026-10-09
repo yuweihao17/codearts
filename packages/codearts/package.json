@@ -1,0 +1,20 @@
+{
+  "name": "@magpie-community/opencode-codearts-auth",
+  "version": "0.1.0",
+  "description": "OpenCode provider plugin: Huawei Cloud CodeArts (码道 代码智能体) models via OAuth sign-in",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": ["index.mjs", "README.md", "DESIGN.md"],
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": ["opencode", "opencode-plugin", "magpie", "codearts", "huaweicloud", "oauth", "pangu", "maas", "dpop", "pkce"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/magpie-community/plugins.git",
+    "directory": "packages/codearts"
+  },
+  "magpie": { "maxConcurrency": 4 }
+}
