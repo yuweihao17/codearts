@@ -741,6 +741,23 @@ async function fetchRemoteModels(cred, fetcher) {
   return models
 }
 
+/** Chinese labels for the credit metric buckets CodeArts reports. */
+const CREDIT_METRIC_LABELS = {
+  usageTotalPackageCredit: "总积分",
+  usageBasicPackageCredit: "基础积分包",
+  usageOnDemandPackageCredit: "按需积分包",
+  usageBonusPackageCredit: "赠送积分包",
+}
+const TOTAL_CREDIT_METRIC = "usageTotalPackageCredit"
+
+/** Compact credit counts for the display string (12345 → "1.2万"). */
+function formatCredit(n) {
+  const v = Math.max(0, Number.isFinite(n) ? n : 0)
+  if (v >= 1e8) return `${(v / 1e8).toFixed(1)}亿`
+  if (v >= 1e4) return `${(v / 1e4).toFixed(1)}万`
+  return String(Math.round(v))
+}
+
 /** Map the account's `statistics/plugin` answer to magpie's usage shape. */
 function usageFromStatistics(raw) {
   let data = raw
@@ -752,16 +769,33 @@ function usageFromStatistics(raw) {
   const pkg = asRecord(data.package)
   const plan = firstOf(pkg.package_name_cn, pkg.package_name_en, pkg.spec_code)
   const metrics = Array.isArray(data.metrics) ? data.metrics : []
-  const total = metrics.find((m) => asRecord(m).name === "usageTotalPackageCredit")
+
   const windows = []
-  if (total) {
-    const rec = asRecord(total)
-    const amount = num(rec.package_credit_amount)
+  for (const item of metrics) {
+    const rec = asRecord(item)
+    const name = CREDIT_METRIC_LABELS[rec.name]
+    if (!name) continue
+    const limit = num(rec.package_credit_amount)
     const remain = num(rec.package_credit_remain)
-    const used = amount > 0 ? clamp(((amount - remain) / amount) * 100) : undefined
-    if (used !== undefined) windows.push({ name: "total credits", used })
+    if (limit <= 0 && remain <= 0) continue // empty bucket, nothing to show
+    const amount = clamp(limit > 0 ? ((limit - remain) / limit) * 100 : 0)
+    const used = Math.max(0, limit - remain)
+    windows.push({
+      name,
+      used: amount,
+      display: `${formatCredit(used)} / ${formatCredit(limit)}`,
+      amount: used,
+      limit,
+      unit: "credits",
+    })
   }
-  return { plan: plan || undefined, windows }
+
+  // Keep the package total on top, then the per-bucket breakdown.
+  const totalLabel = CREDIT_METRIC_LABELS[TOTAL_CREDIT_METRIC]
+  windows.sort((a, b) => (a.name === totalLabel ? -1 : b.name === totalLabel ? 1 : 0))
+
+  if (windows.length > 0) return { plan: plan || undefined, signIn: "kept", windows }
+  return { plan: plan || undefined, windows, error: "该账号无积分额度" }
 }
 
 // ---- the plugin -------------------------------------------------------------
@@ -816,7 +850,6 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
     auth: {
       provider: PROVIDER,
       refreshLead: REFRESH_LEAD_MS,
-      icon: "shield",
       maxConcurrency: 4,
 
       // magpie's own hook: renew the temporary credentials before they expire.
@@ -941,7 +974,7 @@ export const _internal = {
   PROVIDER, NPM, CATALOG, CONTEXT_WINDOWS, BENEFIT_MODEL_FALLBACK,
   CHAT_API_BASE, SNAP_MODEL_BUILTIN_URL, SNAP_STATISTICS_URL, OPENGW_GATEWAY_CONFIG_URL,
   PORTAL_AUTHORIZE_BASE, STS_TOKEN_ENDPOINT, CLIENT_ID, REDIRECT_PATH,
-  firstOf, asRecord, safeJson, num, clamp, prettify, normalizeModelId,
+  firstOf, asRecord, safeJson, num, clamp, prettify, normalizeModelId, formatCredit,
   b64url, utf8, sha256Hex, hmacSha256Hex,
   generatePkcePair, generateDpopKeyPair, keyPairFromStoredJwk, signDpopJws,
   buildCanonicalRequest, signRequestHuawei,

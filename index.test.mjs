@@ -172,13 +172,31 @@ test("buildOAuthLoginUrl matches the real IDE parameters", () => {
   assert.equal(q.has("auth_callback_url"), false)
 })
 
-test("usageFromStatistics maps the credit metric to a used-percentage window", () => {
+test("usageFromStatistics maps credit metrics to windows with real numbers", () => {
   const usage = x.usageFromStatistics({
     package: { package_name_cn: "企业版" },
-    metrics: [{ name: "usageTotalPackageCredit", package_credit_amount: 1000, package_credit_remain: 250, package_credit_used: 750 }],
+    metrics: [
+      { name: "usageTotalPackageCredit", package_credit_amount: 1000, package_credit_remain: 250, package_credit_used: 750 },
+      { name: "usageBasicPackageCredit", package_credit_amount: 1000, package_credit_remain: 250, package_credit_used: 750 },
+      { name: "usageOnDemandPackageCredit", package_credit_amount: 20000, package_credit_remain: 20000 },
+    ],
   })
   assert.equal(usage.plan, "企业版")
-  assert.deepEqual(usage.windows, [{ name: "total credits", used: 75 }])
+  assert.equal(usage.signIn, "kept")
+  // The package total is listed first, then the buckets, all with display numbers.
+  assert.deepEqual(usage.windows, [
+    { name: "总积分", used: 75, display: "750 / 1000", amount: 750, limit: 1000, unit: "credits" },
+    { name: "基础积分包", used: 75, display: "750 / 1000", amount: 750, limit: 1000, unit: "credits" },
+    { name: "按需积分包", used: 0, display: "0 / 2.0万", amount: 0, limit: 20000, unit: "credits" },
+  ])
+})
+
+test("usageFromStatistics reports no credit plan when every bucket is empty", () => {
+  const usage = x.usageFromStatistics({
+    metrics: [{ name: "usageTotalPackageCredit", package_credit_amount: 0, package_credit_remain: 0 }],
+  })
+  assert.deepEqual(usage.windows, [])
+  assert.equal(usage.error, "该账号无积分额度")
 })
 
 test("usageFromStatistics surfaces a business error code", () => {
@@ -364,7 +382,9 @@ test("auth.usage reports the plan's credit window", async () => {
   const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
   const usage = await plugin.auth.usage(async () => makeAuth(cred))
   assert.equal(usage.plan, "企业版")
-  assert.deepEqual(usage.windows, [{ name: "total credits", used: 60 }])
+  assert.deepEqual(usage.windows, [
+    { name: "总积分", used: 60, display: "600 / 1000", amount: 600, limit: 1000, unit: "credits" },
+  ])
 })
 
 // ---- OAuth callback server -------------------------------------------------
