@@ -1,5 +1,5 @@
 {
-  "name": "@magpie-community/opencode-codearts-auth",
+  "name": "opencode-codearts-auth",
   "version": "0.1.0",
   "description": "OpenCode provider plugin: Huawei Cloud CodeArts (码道 代码智能体) models via OAuth sign-in",
   "type": "module",
@@ -14,6 +14,10 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/yuweihao17/codearts.git"
+  },
+  "homepage": "https://github.com/yuweihao17/codearts#readme",
+  "bugs": {
+    "url": "https://github.com/yuweihao17/codearts/issues"
   },
   "magpie": { "maxConcurrency": 4 }
 }

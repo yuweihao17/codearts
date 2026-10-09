@@ -1,5 +1,11 @@
 # opencode-codearts-auth
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![magpie plugin](https://img.shields.io/badge/magpie-plugin-8A2BE2)](https://usemagpie.ai/docs/zh/plugins)
+[![OpenCode plugin](https://img.shields.io/badge/OpenCode-plugin-blue)](https://opencode.ai)
+![no dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+![tests](https://img.shields.io/badge/tests-28%20passing-success)
+
 [Huawei Cloud CodeArts (华为云码道 代码智能体)](https://www.huaweicloud.com/product/codearts.html)  
 作为 magpie / OpenCode 的 provider 插件：用**华为云 OAuth 授权登录**接入码道的模型  
 （盘古 openPangu、DeepSeek、GLM 等）。
@@ -61,6 +67,42 @@ magpie plugin add ./index.mjs
 -   本插件不内置 MCP / 中间件，仅做模型接入。
 -   依赖：无（签名、PKCE、DPoP 都用运行时内置的 WebCrypto，无需 `jose` 等三方库）。
 
+## English
+
+**opencode-codearts-auth** is a magpie / OpenCode provider plugin that signs you in to
+[Huawei Cloud CodeArts (码道)](https://www.huaweicloud.com/product/codearts.html) with
+**Huawei Cloud OAuth** (PKCE + DPoP) and exposes its models (openPangu, DeepSeek, GLM, …).
+
+The CodeArts gateway is OpenAI-compatible Chat Completions, but it does **not** accept an API key:
+every request must be signed with temporary AK/SK/security-token credentials (*SDK-HMAC-SHA256*),
+and those credentials come from an OAuth sign-in. This plugin implements the whole chain —
+local-callback PKCE OAuth, per-request SDK-HMAC-SHA256 signing, silent refresh — with **no runtime dependencies**.
+
+### Install
+
+```sh
+magpie plugin add yuweihao17/codearts
+```
+
+### Sign in
+
+Pick **Sign in with Huawei Cloud** (or run `magpie plugin login codearts`). Your browser opens the
+Huawei Cloud consent page; after you approve, it redirects back to a local `127.0.0.1` callback and
+the plugin finishes signing in. No API key, no copy-paste.
+
+### Use
+
+Models appear as `codearts/GLM-5.2`, `codearts/glm-5.3-flash`, `codearts/openpangu-2.0-flash`,
+`codearts/deepseek-v4.1-flash`, … Verify with `magpie provider test codearts`, or pin one with
+`codearts --model codearts/GLM-5.2`.
+
+### Notes
+
+- Region/endpoint is fixed to Huawei Cloud `cn-north-4`.
+- `benefit` (free-quota) models are detected automatically and sent with a signed `maas_type: benefit` header.
+- Usage is best-effort, read from the credits endpoint.
+- No MCP / gateway middleware — model access only.
+
 ## License
 
-MIT
+MIT — see [LICENSE](./LICENSE).

@@ -1,5 +1,5 @@
 {
-  "package": "@magpie-community/opencode-codearts-auth",
+  "package": "opencode-codearts-auth",
   "name": "CodeArts",
   "icon": "codearts",
   "providers": ["codearts"],
