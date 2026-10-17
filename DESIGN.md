@@ -71,6 +71,27 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
    - 签名与 PKCE/DPoP 全部用运行时内置 WebCrypto（`globalThis.crypto.subtle`）
      实现，不引入 `jose`；唯一的内置模块依赖是 `node:http`（本地回调服务器）。
 
+7. **会话与错误自愈**（针对 issue #1 的「完全无法开始对话」）
+   - 上游网关按 `Chat-Id` 计并发会话，每账号上限 **3 个**，会话在响应完成后还要
+     存活一段时间。旧版每个请求都随机生成 `Chat-Id`，请求一密集就把 3 个槽位占死，
+     之后每个请求都吃 `400 TM.00001041`（并发会话数已达上限）。
+   - `Chat-Id` / `Session-Id` 从账号凭据**派生**（`sha256("codearts:" + access_key_id)`
+     取两段 32 位 hex）：实测服务端按 `Chat-Id` 复用会话，同 id 连发/并发——含一条
+     流式一条非流式、以及同一会话 4 路并发（答案零串扰）——都不再累计槽位；派生使
+     **所有进程、所有设备**上的同一账号共享同一个会话，插件自身永远只占一个槽，
+     跨进程（CLI / TUI / 常驻网关）也不再互相挤占。id 仅在 STS 轮换 AK 后变化。
+   - 对残余的 `TM.00001041`（同账号其它端/官方客户端占槽）在 `signedFetch` 里做
+     带抖动的退避重试（1s→2s→4s→6s→8s→10s→12s→15s 均匀轮询，槽位自行回收、
+     每次重试重新签名以保证 `x-sdk-date` 新鲜）；其它 400 原样透传；`AbortSignal`
+     在重试间隙生效。
+   - `401`（IAM 报 `APIG.0301 verify ak sk signature fail`，即临时凭据过期/被轮换）
+     触发一次**强制续期 + 重试**（与临期续期共用单飞，失败后 10s 冷却），免得一次
+     错过的定时续期把账号打死到手动重新登录；续期救不回来才标 `X-Magpie-Sign-In:
+     expired`。
+   - 已知限制：无额度账号请求 `openpangu-2.0-flash` 会得到 `content: null` /
+     `completion_tokens: 0` 的 200 响应（benefit 档无 entitlement，见 issue #1）；
+     是否隐藏该模型因账号而异，暂不擅自过滤。
+
 ## 三、实现步骤
 
 1. 建包（本仓库为单包，插件直接放在仓库根目录），`package.json` 声明
@@ -83,7 +104,7 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
      `usage` 汇报用量。
 3. `README.md` 写安装 / 登录 / 使用 / 已知限制。
 4. `index.test.mjs` 覆盖签名、PKCE/DPoP、凭据往返、远端列表、loader 签名、
-   续期、用量、回调服务器，全程不联网（`node --test`，28 项）。
+   续期、用量、回调服务器，全程不联网（`node --test`，37 项）。
 5. `registry-entry.json` 提供加入 `magpie` 插件市场的登记项。
 
 ## 四、目录

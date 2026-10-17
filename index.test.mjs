@@ -5,6 +5,13 @@
 
 import test from "node:test"
 import assert from "node:assert/strict"
+import { mkdtempSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+// The streaming-slot ledger is a file so every process shares it; keep the
+// tests off the real one.
+process.env.MAGPIE_CODEARTS_SLOT_FILE = join(mkdtempSync(join(tmpdir(), "codearts-slots-")), "slots.json")
 
 import { CodeArtsAuthPlugin, _internal as x } from "./index.mjs"
 
@@ -308,7 +315,8 @@ test("loader signs each chat request with SDK-HMAC-SHA256", async () => {
   assert.ok(headers.get("session-id"))
   assert.equal(headers.has("maas_type"), false)
   // The signed body must be forwarded verbatim.
-  assert.equal(new TextDecoder().decode(seen[0].init.body), JSON.stringify({ model: "GLM-5.2", messages: [] }))
+  const forwarded = JSON.parse(new TextDecoder().decode(seen[0].init.body))
+  assert.deepEqual(forwarded, { model: "GLM-5.2", messages: [], thinking: { type: "enabled" } })
 })
 
 test("loader adds a signed maas_type header for benefit models", async () => {
@@ -334,6 +342,447 @@ test("loader adds a signed maas_type header for benefit models", async () => {
 test("loader returns nothing when not signed in", async () => {
   const plugin = await CodeArtsAuthPlugin({ client: {} }, {})
   assert.deepEqual(await plugin.auth.loader(async () => ({ type: "api", key: "k" })), {})
+})
+
+// ---- session reuse + session-limit retry -----------------------------------
+
+const CHAT_URL = "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2/chat/completions"
+const sessionLimitBody = JSON.stringify({
+  error_code: x.SESSION_LIMIT_ERROR,
+  error_msg: "并发会话数已达上限(3个)，请关闭部分会话后重试。",
+})
+
+test("loader reuses one Chat-Id across requests instead of opening a session per call", async () => {
+  const cred = await makeCred()
+  const seen = []
+  const fetcher = async (url, init) => {
+    seen.push(new Headers(init.headers).get("chat-id"))
+    return new Response("ok", { status: 200 })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  for (let i = 0; i < 3; i++) {
+    await loaded.fetch(CHAT_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "GLM-5.2", messages: [] }),
+    })
+  }
+  assert.equal(seen.length, 3)
+  assert.ok(seen[0], "every request must carry a Chat-Id")
+  assert.equal(seen[0], seen[1])
+  assert.equal(seen[0], seen[2])
+})
+
+test("session ids are derived from the account, shared across loaders, unique per account", async () => {
+  const cred = await makeCred()
+  const idsOf = async (c) => await x.sessionIdsFor(c)
+  const a1 = await idsOf(cred)
+  const a2 = await idsOf(cred)
+  // Deterministic: two loaders (processes) on the same account share one session.
+  assert.equal(a1.chatId, a2.chatId)
+  assert.equal(a1.sessionId, a2.sessionId)
+  assert.match(a1.chatId, /^[0-9a-f]{32}$/)
+  assert.match(a1.sessionId, /^[0-9a-f]{32}$/)
+  // A different account (rotated AK) gets its own session.
+  const other = await idsOf({ access_key_id: "AK-other" })
+  assert.notEqual(other.chatId, a1.chatId)
+  assert.notEqual(other.sessionId, a1.sessionId)
+})
+
+test("a fresh loader (new process) sends the same session headers for the same account", async () => {
+  const cred = await makeCred()
+  const seen = []
+  const fetcher = async (url, init) => {
+    seen.push({
+      chat: new Headers(init.headers).get("chat-id"),
+      session: new Headers(init.headers).get("session-id"),
+    })
+    return new Response("ok", { status: 200 })
+  }
+  const make = async () => {
+    const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+    return plugin.auth.loader(async () => makeAuth(cred))
+  }
+  const init = {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "GLM-5.2", messages: [] }),
+  }
+  await (await make()).fetch(CHAT_URL, init)
+  await (await make()).fetch(CHAT_URL, init)
+  assert.equal(seen.length, 2)
+  assert.equal(seen[0].chat, seen[1].chat, "two processes on one account must share the session")
+  assert.equal(seen[0].session, seen[1].session)
+})
+
+test("signedFetch retries the session-limit error with backoff and succeeds", async () => {
+  const cred = await makeCred()
+  let sends = 0
+  const fetcher = async () => {
+    sends++
+    if (sends <= 2) return new Response(sessionLimitBody, { status: 400 })
+    return new Response("ok", { status: 200 })
+  }
+  const res = await x.signedFetch(cred, CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "GLM-5.2" }),
+  }, { chatId: "chat-1", sessionId: "sess-1", fetcher, retryDelays: [1, 1] })
+  assert.equal(res.status, 200)
+  assert.equal(sends, 3)
+})
+
+test("signedFetch gives up after the backoff budget and returns the 400", async () => {
+  const cred = await makeCred()
+  let sends = 0
+  const fetcher = async () => {
+    sends++
+    return new Response(sessionLimitBody, { status: 400 })
+  }
+  const res = await x.signedFetch(cred, CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "GLM-5.2" }),
+  }, { chatId: "chat-1", sessionId: "sess-1", fetcher, retryDelays: [1, 1] })
+  assert.equal(res.status, 400)
+  assert.equal(sends, 3) // the original send + one per injected delay
+  assert.ok((await res.text()).includes(x.SESSION_LIMIT_ERROR))
+})
+
+test("signedFetch does not retry session-limit-unrelated 400 errors", async () => {
+  const cred = await makeCred()
+  let sends = 0
+  const fetcher = async () => {
+    sends++
+    return new Response(JSON.stringify({ error_code: "TM.00009999", error_msg: "其他错误" }), { status: 400 })
+  }
+  const res = await x.signedFetch(cred, CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "GLM-5.2" }),
+  }, { chatId: "chat-1", sessionId: "sess-1", fetcher, retryDelays: [1, 1] })
+  assert.equal(res.status, 400)
+  assert.equal(sends, 1)
+  assert.ok((await res.text()).includes("TM.00009999"))
+})
+
+test("signedFetch aborts between session-limit retries", async () => {
+  const cred = await makeCred()
+  const controller = new AbortController()
+  const fetcher = async () => new Response(sessionLimitBody, { status: 400 })
+  const attempt = x.signedFetch(cred, CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "GLM-5.2" }),
+    signal: controller.signal,
+  }, { chatId: "chat-1", sessionId: "sess-1", fetcher, retryDelays: [50] })
+  controller.abort()
+  await assert.rejects(attempt, { name: "AbortError" })
+})
+
+test("the provider prefix is stripped from the model id before signing", async () => {
+  const cred = await makeCred()
+  let sent = ""
+  const fetcher = async (url, init) => {
+    sent = new TextDecoder().decode(init.body ?? new Uint8Array())
+    return new Response('{"ok":true}', { status: 200 })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  await loaded.fetch(CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "codearts/deepseek-v4.1-flash", messages: [], stream: true }),
+  })
+  const parsed = JSON.parse(sent)
+  assert.equal(parsed.model, "deepseek-v4.1-flash")
+  assert.equal(parsed.stream, true)
+})
+
+test("accountIdentityOf reads the signer out of the refresh token profile", () => {
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url")
+  const profile = b64({ account_id: "A1", account_name: "acme", principal_urn: "iam::A1:user:alice" })
+  const jwt = `${b64({ alg: "RS256" })}.${b64({ user_profile: profile })}.sig`
+  assert.equal(x.accountIdentityOf({ refresh_token: jwt }), "iam::A1:user:alice")
+  // Falls back to the account name when the URN is absent.
+  const bare = `${b64({ alg: "RS256" })}.${b64({ user_profile: b64({ account_name: "acme" }) })}.sig`
+  assert.equal(x.accountIdentityOf({ refresh_token: bare }), "acme")
+  // Anything unusable must not invent an identity.
+  assert.equal(x.accountIdentityOf({}), "")
+  assert.equal(x.accountIdentityOf({ refresh_token: "not-a-jwt" }), "")
+  assert.equal(x.accountIdentityOf({ refresh_token: "a.b.c" }), "")
+})
+
+test("the output budget is clamped to what the gateway accepts", async () => {
+  const cred = await makeCred()
+  const sent = []
+  const fetcher = async (url, init) => {
+    sent.push(JSON.parse(new TextDecoder().decode(init.body ?? new Uint8Array())))
+    return new Response('{"ok":true}', { status: 200 })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  await loaded.fetch(CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "codearts/deepseek-v4.1-flash", messages: [], max_completion_tokens: 128000 }),
+  })
+  assert.equal(sent[0].max_completion_tokens, x.MAX_OUTPUT_TOKENS)
+  // A budget inside the range is left alone.
+  await loaded.fetch(CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "codearts/deepseek-v4.1-flash", messages: [], max_completion_tokens: 1024 }),
+  })
+  assert.equal(sent[1].max_completion_tokens, 1024)
+})
+
+test("model limits declare a usable output budget", async () => {
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, {})
+  const config = {}
+  await plugin.config(config)
+  const m = config.provider.codearts.models["GLM-5.2"]
+  assert.equal(m.limit.output, x.MAX_OUTPUT_TOKENS)
+})
+
+test("chat requests ask for thinking explicitly so it stays out of content", async () => {
+  const cred = await makeCred()
+  const sent = []
+  const fetcher = async (url, init) => {
+    sent.push(JSON.parse(new TextDecoder().decode(init.body ?? new Uint8Array())))
+    return new Response('{"ok":true}', { status: 200 })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  await loaded.fetch(CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "codearts/deepseek-v4.1-flash", messages: [{ role: "user", content: "hi" }] }),
+  })
+  // Left to its default the gateway streams the reasoning as content; asking
+  // for it explicitly routes it to reasoning_content instead.
+  assert.deepEqual(sent[0].thinking, { type: "enabled" })
+
+  // A caller's own choice wins.
+  await loaded.fetch(CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "codearts/deepseek-v4.1-flash", messages: [], thinking: { type: "disabled" } }),
+  })
+  assert.deepEqual(sent[1].thinking, { type: "disabled" })
+})
+test("streaming requests wait for a free slot instead of hitting the 3-session cap", async () => {
+  // The gateway allows 3 concurrent streaming sessions per account and holds a
+  // finished one ~60 s; a 4th is refused with TM.00001041. Four streaming calls
+  // must therefore arrive spaced out, while a non-streaming call never waits.
+  const cred = await makeCred()
+  const arrivals = []
+  const fetcher = async (url, init) => {
+    const sent = typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body ?? new Uint8Array())
+    arrivals.push({ at: Date.now(), stream: JSON.parse(sent || "{}").stream === true })
+    return new Response("data: {}\n\n", { status: 200, headers: { "content-type": "text/event-stream" } })
+  }
+  const ctx = { chatId: "c", sessionId: "s", fetcher, retryDelays: [], slotHoldMs: 120 }
+  const body = (stream, key) => JSON.stringify({ model: "deepseek-v4.1-flash", stream, messages: [{ role: "user", content: key }] })
+  const slots = [
+    x.signedFetch(cred, CHAT_URL, { method: "POST", body: body(true, "a") }, { ...ctx, slotKey: "acct-1" }),
+    x.signedFetch(cred, CHAT_URL, { method: "POST", body: body(true, "b") }, { ...ctx, slotKey: "acct-1" }),
+    x.signedFetch(cred, CHAT_URL, { method: "POST", body: body(true, "c") }, { ...ctx, slotKey: "acct-1" }),
+  ]
+  for (const r of await Promise.all([...slots])) await r.text()
+  // The first three went out together; the ledger is now full.
+  assert.equal(arrivals.length, 3)
+  const started = Date.now()
+  const fourth = await x.signedFetch(cred, CHAT_URL, { method: "POST", body: body(true, "d") }, { ...ctx, slotKey: "acct-1" })
+  await fourth.text()
+  assert.ok(Date.now() - started >= 100, "the 4th streaming request must wait for a slot")
+  assert.equal(arrivals.length, 4)
+
+  // A non-streaming request never takes a slot and never waits.
+  const t = Date.now()
+  const plain = await x.signedFetch(cred, CHAT_URL, { method: "POST", body: body(false, "e") }, { ...ctx, slotKey: "acct-1" })
+  await plain.text()
+  assert.ok(Date.now() - t < 100, "non-streaming requests must not queue")
+})
+
+test("a streaming slot is freed when the body is fully read", async () => {
+  const cred = await makeCred()
+  let calls = 0
+  const fetcher = async () => {
+    calls++
+    return new Response("data: {}\n\n", { status: 200, headers: { "content-type": "text/event-stream" } })
+  }
+  // A hold of 5 s would make the second call wait if the slot were not released.
+  const ctx = { chatId: "c", sessionId: "s", fetcher, retryDelays: [], slotHoldMs: 5_000, slotKey: "acct-2" }
+  const body = JSON.stringify({ model: "deepseek-v4.1-flash", stream: true })
+  for (let i = 0; i < 4; i++) {
+    const res = await x.signedFetch(cred, CHAT_URL, { method: "POST", body }, ctx)
+    assert.equal(await res.text(), "data: {}\n\n")
+  }
+  assert.equal(calls, 4)
+  // Reset the ledger so other tests are unaffected.
+  await new Promise((r) => setTimeout(r, 10))
+})
+
+test("a streaming request with no slot in budget degrades to a one-shot SSE answer", async () => {
+  const cred = await makeCred()
+  const bodies = []
+  const fetcher = async (url, init) => {
+    const sent = typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body ?? new Uint8Array())
+    bodies.push(JSON.parse(sent))
+    return new Response(JSON.stringify({
+      id: "chatcmpl-x", object: "chat.completion", model: "deepseek-v4.1-flash",
+      choices: [{ index: 0, message: { role: "assistant", content: "hello" }, finish_reason: "stop" }],
+    }), { status: 200, headers: { "content-type": "application/json" } })
+  }
+  const ctx = { chatId: "c", sessionId: "s", fetcher, retryDelays: [], slotHoldMs: 60_000, slotWaitMs: 30, slotKey: "acct-degrade" }
+  const body = JSON.stringify({ model: "deepseek-v4.1-flash", stream: true })
+  // Fill all three slots.
+  for (let i = 0; i < 3; i++) await (await x.signedFetch(cred, CHAT_URL, { method: "POST", body }, ctx)).text()
+  // The next streaming call cannot get a slot: it goes out non-streaming and
+  // comes back as SSE with the whole answer in one chunk.
+  const res = await x.signedFetch(cred, CHAT_URL, { method: "POST", body }, ctx)
+  assert.equal(res.status, 200)
+  assert.match(new Headers(res.headers).get("content-type"), /text\/event-stream/)
+  const sse = await res.text()
+  assert.match(sse, /data: \{.*"object":"chat.completion.chunk".*\}\n\n/)
+  assert.ok(sse.trimEnd().endsWith("data: [DONE]"))
+  assert.equal(bodies.at(-1).stream, false, "the degraded call must not ask for a stream")
+})
+
+test("an aborted wait for a slot rejects", async () => {
+  const cred = await makeCred()
+  const fetcher = async () => new Response("data: {}\n\n", { status: 200 })
+  const ctx = { chatId: "c", sessionId: "s", fetcher, retryDelays: [], slotHoldMs: 60_000, slotWaitMs: 60_000, slotKey: "acct-abort" }
+  const body = JSON.stringify({ model: "deepseek-v4.1-flash", stream: true })
+  for (let i = 0; i < 3; i++) await (await x.signedFetch(cred, CHAT_URL, { method: "POST", body }, ctx)).text()
+  const controller = new AbortController()
+  const attempt = x.signedFetch(cred, CHAT_URL, { method: "POST", body, signal: controller.signal }, ctx)
+  setTimeout(() => controller.abort(), 20)
+  await assert.rejects(attempt, { name: "AbortError" })
+})
+
+test("loader refreshes and retries when the security token has expired (APIG.0602)", async () => {
+  const cred = await makeCred()
+  let chats = 0
+  let stsCalls = 0
+  const authz = []
+  const fetcher = async (url, init) => {
+    if (String(url).includes("/chat/completions")) {
+      chats++
+      authz.push(new Headers(init.headers).get("authorization"))
+      if (chats === 1) {
+        return new Response(JSON.stringify({
+          error_msg: "Bad request: the security token has expired", error_code: "APIG.0602",
+        }), { status: 400 })
+      }
+      return new Response("ok", { status: 200 })
+    }
+    stsCalls++
+    return stsResponse()
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "GLM-5.2", messages: [] }),
+  })
+  assert.equal(res.status, 200)
+  assert.equal(chats, 2, "the stale-token call must be retried once")
+  assert.equal(stsCalls, 1)
+  assert.match(authz[1], /^SDK-HMAC-SHA256 Access=AK2,/)
+})
+
+// ---- 401 self-heal ----------------------------------------------------------
+
+function stsResponse() {
+  return new Response(JSON.stringify({
+    credentials: { access_key_id: "AK2", secret_access_key: "SK2", security_token: "ST2", expiration: "2031-01-01T00:00:00Z" },
+    refresh_token: "R2",
+  }), { status: 200 })
+}
+
+test("loader force-refreshes the credential and retries once on a 401", async () => {
+  const cred = await makeCred()
+  const authz = []
+  let chats = 0
+  let stsCalls = 0
+  const fetcher = async (url, init) => {
+    if (String(url).includes("/chat/completions")) {
+      chats++
+      authz.push(new Headers(init.headers).get("authorization"))
+      if (chats === 1) {
+        return new Response(JSON.stringify({
+          error_code: "APIG.0301",
+          error_msg: "Incorrect IAM authentication information: verify ak sk signature fail",
+        }), { status: 401 })
+      }
+      return new Response("ok", { status: 200 })
+    }
+    stsCalls++
+    return stsResponse()
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "GLM-5.2", messages: [] }),
+  })
+  assert.equal(res.status, 200)
+  assert.equal(chats, 2)
+  assert.equal(stsCalls, 1)
+  // The retried request is signed with the refreshed credential.
+  assert.match(authz[0], /^SDK-HMAC-SHA256 Access=AK,/)
+  assert.match(authz[1], /^SDK-HMAC-SHA256 Access=AK2,/)
+})
+
+test("concurrent 401s share a single forced refresh", async () => {
+  const cred = await makeCred()
+  let chats = 0
+  let stsCalls = 0
+  const fetcher = async (url) => {
+    if (String(url).includes("/chat/completions")) {
+      chats++
+      if (chats <= 2) return new Response('{"error_code":"APIG.0301"}', { status: 401 })
+      return new Response("ok", { status: 200 })
+    }
+    stsCalls++
+    return stsResponse()
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const init = {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "GLM-5.2", messages: [] }),
+  }
+  const [a, b] = await Promise.all([loaded.fetch(CHAT_URL, init), loaded.fetch(CHAT_URL, init)])
+  assert.equal(a.status, 200)
+  assert.equal(b.status, 200)
+  assert.equal(stsCalls, 1)
+})
+
+test("loader marks the account expired when a refresh cannot save the 401", async () => {
+  const cred = await makeCred()
+  const fetcher = async (url) => {
+    if (String(url).includes("/chat/completions")) {
+      return new Response('{"error_code":"APIG.0301"}', { status: 401 })
+    }
+    // The refresh token itself is dead.
+    return new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "GLM-5.2", messages: [] }),
+  })
+  assert.equal(res.status, 401)
+  assert.equal(new Headers(res.headers).get("x-magpie-sign-in"), "expired")
 })
 
 test("auth.refresh exchanges the refresh token for fresh credentials", async () => {
@@ -385,6 +834,27 @@ test("auth.usage reports the plan's credit window", async () => {
   assert.deepEqual(usage.windows, [
     { name: "总积分", used: 60, display: "600 / 1000", amount: 600, limit: 1000, unit: "credits" },
   ])
+})
+
+test("an exhausted quota reported inside a 200 becomes a real error", async () => {
+  const cred = await makeCred()
+  const frame = `data:${JSON.stringify({ error_code: x.QUOTA_ERROR, error_msg: "insufficient quota" })}\n\n`
+  const fetcher = async () => new Response(frame, { status: 200, headers: { "content-type": "text/event-stream" } })
+  const res = await x.signedFetch(cred, CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "deepseek-v4.1-flash", stream: true }),
+  }, { chatId: "c", sessionId: "s", fetcher, retryDelays: [], slotKey: "acct-quota", slotHoldMs: 1000 })
+  // A caller must not see "200 with no answer": say what happened.
+  assert.equal(res.status, 402)
+  const body = JSON.parse(await res.text())
+  assert.equal(body.error.code, x.QUOTA_ERROR)
+  assert.match(body.error.message, /积分不足/)
+})
+
+test("quotaErrorOf leaves a real reply alone", () => {
+  const res = new Response('{"choices":[{"message":{"content":"hi"}}]}', { status: 200 })
+  assert.equal(x.quotaErrorOf(res, 'data:{"choices":[{"delta":{"content":"hi"}}]}\n\n'), null)
 })
 
 // ---- OAuth callback server -------------------------------------------------

@@ -4,7 +4,7 @@
 [![magpie plugin](https://img.shields.io/badge/magpie-plugin-8A2BE2)](https://usemagpie.ai/docs/zh/plugins)
 [![OpenCode plugin](https://img.shields.io/badge/OpenCode-plugin-blue)](https://opencode.ai)
 ![no dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
-![tests](https://img.shields.io/badge/tests-28%20passing-success)
+![tests](https://img.shields.io/badge/tests-37%20passing-success)
 
 [Huawei Cloud CodeArts (华为云码道 代码智能体)](https://www.huaweicloud.com/product/codearts.html)  
 作为 magpie / OpenCode 的 provider 插件：用**华为云 OAuth 授权登录**接入码道的模型  
@@ -53,6 +53,17 @@ magpie plugin add ./index.mjs
 
 ## 说明与已知限制
 
+-   **会话管理**：上游按 `Chat-Id` 计并发会话（每账号上限 3 个，会话在响应完成后
+    还会存活一段时间）。插件的 `Chat-Id` / `Session-Id` 从账号凭据**派生**——同一账号的
+    所有进程、所有设备共享同一个上游会话，无论调用多密集都只占一个槽位
+    （已实测同一会话上 4 路并发互不串扰）；同账号其它端（如官方客户端）占满槽位时，
+    对 `TM.00001041`（并发会话数已达上限）做带抖动的退避重试后再报错。因此密集调用
+    （agent 一条消息一串请求）不会再把对话打死。
+-   **凭据自愈**：`401`（IAM `APIG.0301 verify ak sk signature fail`，即临时凭据
+    过期或被轮换）会自动强制续期并重试一次，续期救不回来才把账号标记为需要
+    重新登录。
+-   **`openpangu-2.0-flash`**：无对应额度的账号请求它会得到 `content: null` /
+    0 token 的 200 响应（benefit 档无 entitlement），重试无效；能否使用因账号而异。
 -   **模型目录**是出厂默认（上下文窗口取自码道模型卡：`GLM-5.2` = 202752、  
     `glm-5.3-flash` / `deepseek-v4-flash` / `deepseek-v4-pro` = 1048576、  
     `deepseek-v4.1-flash` = 1000000）。账号能返回实时列表时会覆盖 `id`/`name`。
@@ -98,6 +109,18 @@ Models appear as `codearts/GLM-5.2`, `codearts/glm-5.3-flash`, `codearts/openpan
 
 ### Notes
 
+- **Sessions**: the gateway counts concurrent sessions per `Chat-Id` (max 3 per
+  account, and a finished session keeps its slot briefly). The plugin derives
+  its `Chat-Id`/`Session-Id` from the account credential, so every process and
+  device on the same account shares one upstream session — rapid agent bursts
+  never exhaust the limit (verified: 4-way concurrency on one session, no
+  cross-talk); if other clients hold the slots, `TM.00001041` is retried with
+  jittered backoff before surfacing.
+- **Self-heal**: a `401` signature rejection (stale/rotated temporary credential)
+  forces one credential refresh + retry before the account is marked as needing
+  a new sign-in.
+- `openpangu-2.0-flash` answers `content: null` / 0 tokens on accounts without
+  its entitlement — account-dependent, not retryable.
 - Region/endpoint is fixed to Huawei Cloud `cn-north-4`.
 - `benefit` (free-quota) models are detected automatically and sent with a signed `maas_type: benefit` header.
 - Usage is best-effort, read from the credits endpoint.

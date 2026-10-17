@@ -1,6 +1,6 @@
 {
   "name": "opencode-codearts-auth",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OpenCode provider plugin: Huawei Cloud CodeArts (码道 代码智能体) models via OAuth sign-in",
   "type": "module",
   "main": "./index.mjs",
